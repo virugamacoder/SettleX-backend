@@ -7,16 +7,36 @@ on:
 
 jobs:
   deploy:
-    name: Deploy to Production Server
+    name: Deploy to Production Server (EC2)
     runs-on: ubuntu-latest
 
     steps:
-      # ── 1. Checkout code (just for validation, not needed on server) ──
+      # ── 1. Checkout code ──────────────────────────────────────────────
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # ── 2. SSH into server and deploy ────────────────────────────────
-      - name: Deploy via SSH
+      # ── 2. Write SSL certs to server via secrets ──────────────────────
+      #    private.key and cert.pem are stored in GitHub Secrets and
+      #    written directly to the server — never committed to git.
+      - name: Write SSL Certificates to Server
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: ${{ secrets.SERVER_PORT }}
+          script: |
+            set -e
+            CERT_DIR="${{ secrets.APP_DIR }}/nginx/certs"
+            mkdir -p "$CERT_DIR"
+            echo "${{ secrets.SSL_PRIVATE_KEY }}" > "$CERT_DIR/private.key"
+            echo "${{ secrets.SSL_CERT_PEM }}"    > "$CERT_DIR/cert.pem"
+            chmod 600 "$CERT_DIR/private.key"
+            chmod 644 "$CERT_DIR/cert.pem"
+            echo "[✓] SSL certificates written to $CERT_DIR"
+
+      # ── 3. Deploy app via SSH ─────────────────────────────────────────
+      - name: Deploy Application
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SERVER_HOST }}
@@ -30,14 +50,13 @@ jobs:
             echo "  SettleX Backend — Starting Deploy  "
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-            # Navigate to project directory
             cd ${{ secrets.APP_DIR }}
 
             # Pull latest changes
             echo "[1/4] Pulling latest code from main..."
             git pull origin main
 
-            # Install dependencies (only production)
+            # Install production dependencies only
             echo "[2/4] Installing dependencies..."
             npm install --omit=dev
 
@@ -47,7 +66,7 @@ jobs:
               && pm2 reload ecosystem.config.json --update-env \
               || pm2 start ecosystem.config.json
 
-            # Save PM2 process list
+            # Save PM2 process list (survives server reboots)
             echo "[4/4] Saving PM2 process list..."
             pm2 save
 

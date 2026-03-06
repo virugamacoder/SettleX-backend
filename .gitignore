@@ -81,6 +81,16 @@ Thumbs.db
 *.db
 
 # =========================
+# SSL Certificates (NEVER commit — store in GitHub Secrets)
+# =========================
+nginx/certs/private.key
+nginx/certs/cert.pem
+*.key
+*.pem
+*.crt
+*.csr
+
+# =========================
 # Uploads / generated files
 # =========================
 uploads/
