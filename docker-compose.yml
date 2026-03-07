@@ -21,9 +21,9 @@ services:
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/health"]
       interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
     logging:
       driver: "json-file"
       options:
@@ -46,7 +46,7 @@ services:
       - settlex-net
     depends_on:
       app:
-        condition: service_healthy
+        condition: service_started
     logging:
       driver: "json-file"
       options:

@@ -91,6 +91,8 @@ jobs:
         uses: actions/checkout@v4
 
       # ── Step 1: Write .env file on server ─────────────────────────────────
+      # NOTE: We write each line with printf to avoid YAML indentation
+      #       contaminating values inside a heredoc.
       - name: Write .env to Server
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -102,20 +104,22 @@ jobs:
             set -e
             APP_DIR="${{ secrets.APP_DIR }}"
             mkdir -p "$APP_DIR"
+            ENV_FILE="$APP_DIR/.env"
 
             echo "──── Writing .env ────"
-            cat > "$APP_DIR/.env" << 'ENVEOF'
-            NODE_ENV=${{ secrets.NODE_ENV }}
-            PORT=${{ secrets.PORT }}
-            BASE_URL=${{ secrets.BASE_URL }}
-            MONGODB_URL=${{ secrets.MONGODB_URL }}
-            JWT_SECRET=${{ secrets.JWT_SECRET }}
-            JWT_ACCESS_EXPIRATION_MINUTES=${{ secrets.JWT_ACCESS_EXPIRATION_MINUTES }}
-            JWT_REFRESH_EXPIRATION_DAYS=${{ secrets.JWT_REFRESH_EXPIRATION_DAYS }}
-            COINMARKET_CAP_API_KEY=${{ secrets.COINMARKET_CAP_API_KEY }}
-            DOCKER_IMAGE=${{ secrets.DOCKER_HUB_USERNAME }}/settlex-backend:latest
-            ENVEOF
+            # Write using printf per-line — immune to YAML indentation
+            printf 'NODE_ENV=%s\n'                        '${{ secrets.NODE_ENV }}'                        > "$ENV_FILE"
+            printf 'PORT=%s\n'                            '${{ secrets.PORT }}'                            >> "$ENV_FILE"
+            printf 'BASE_URL=%s\n'                        '${{ secrets.BASE_URL }}'                        >> "$ENV_FILE"
+            printf 'MONGODB_URL=%s\n'                     '${{ secrets.MONGODB_URL }}'                     >> "$ENV_FILE"
+            printf 'JWT_SECRET=%s\n'                      '${{ secrets.JWT_SECRET }}'                      >> "$ENV_FILE"
+            printf 'JWT_ACCESS_EXPIRATION_MINUTES=%s\n'   '${{ secrets.JWT_ACCESS_EXPIRATION_MINUTES }}'   >> "$ENV_FILE"
+            printf 'JWT_REFRESH_EXPIRATION_DAYS=%s\n'     '${{ secrets.JWT_REFRESH_EXPIRATION_DAYS }}'     >> "$ENV_FILE"
+            printf 'COINMARKET_CAP_API_KEY=%s\n'          '${{ secrets.COINMARKET_CAP_API_KEY }}'          >> "$ENV_FILE"
+            printf 'DOCKER_IMAGE=%s\n'                    '${{ secrets.DOCKER_HUB_USERNAME }}/settlex-backend:latest' >> "$ENV_FILE"
             echo "[✓] .env written"
+            echo "[✓] .env contents (keys only):"
+            cut -d= -f1 "$ENV_FILE"
 
       # ── Step 2: Write SSL certificates on server ───────────────────────────
       - name: Write SSL Certificates to Server
