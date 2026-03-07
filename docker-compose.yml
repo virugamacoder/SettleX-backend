@@ -8,7 +8,7 @@ services:
   # ── Node.js Application ──────────────────────────────────────────────────
   app:
     image: ${DOCKER_IMAGE:-settlex-backend:latest}
-    container_name: settlex-app
+    # container_name: settlex-app
     restart: unless-stopped
     env_file:
       - .env
@@ -33,7 +33,7 @@ services:
   # ── Nginx Reverse Proxy ──────────────────────────────────────────────────
   nginx:
     image: nginx:1.25-alpine
-    container_name: settlex-nginx
+    # container_name: settlex-nginx
     restart: unless-stopped
     ports:
       - "80:80"
