@@ -1,72 +1,80 @@
 #!/bin/bash
-# ─────────────────────────────────────────────────────────
-#  SettleX Backend — Server Setup Script (run ONCE on VPS)
-#  This prepares the server to receive CI/CD deployments.
-# ─────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  SettleX Backend — EC2 First-Time Setup Script
+#  Run this ONCE on a fresh AWS EC2 instance (Ubuntu 22.04/24.04)
+#  After this, all deployments are handled automatically by GitHub Actions CI/CD
+#
+#  Usage:
+#    chmod +x deploy/setup-server.sh
+#    bash deploy/setup-server.sh
+# ─────────────────────────────────────────────────────────────────────────────
 
 set -e
 
-APP_DIR="/var/www/settlex-backend"   # Change this to your preferred path
-REPO_URL="https://github.com/virugamacoder/SettleX-backend.git"
-NODE_VERSION="20"
-
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  SettleX Backend — Initial Server Setup"
+echo "  SettleX Backend — EC2 Docker Setup"
+echo "  This script runs ONCE to prepare the server."
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-# ── Install Node.js (via nvm) ──────────────────────────
-if ! command -v node &> /dev/null; then
-  echo "[*] Installing Node.js $NODE_VERSION..."
-  curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | sudo -E bash -
-  sudo apt-get install -y nodejs
+# ── 1. System Update ─────────────────────────────────────────────────────────
+echo ""
+echo "[1/4] Updating system packages..."
+sudo apt-get update -y
+sudo apt-get upgrade -y
+
+# ── 2. Install Docker ─────────────────────────────────────────────────────────
+echo ""
+echo "[2/4] Installing Docker..."
+if command -v docker &>/dev/null; then
+  echo "      [✓] Docker already installed: $(docker --version)"
 else
-  echo "[✓] Node.js already installed: $(node -v)"
+  # Official Docker install for Ubuntu
+  sudo apt-get install -y ca-certificates curl gnupg lsb-release
+
+  sudo install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+    | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  sudo chmod a+r /etc/apt/keyrings/docker.gpg
+
+  echo \
+    "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+    https://download.docker.com/linux/ubuntu \
+    $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+    | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+  sudo apt-get update -y
+  # Install Docker Engine + Compose plugin (modern approach — no separate docker-compose binary)
+  sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+  echo "      [✓] Docker installed: $(docker --version)"
 fi
 
-# ── Install PM2 globally ───────────────────────────────
-if ! command -v pm2 &> /dev/null; then
-  echo "[*] Installing PM2..."
-  sudo npm install -g pm2
-  pm2 startup  # enables PM2 to start on system boot
+# ── 3. Add current user to docker group (no sudo needed) ──────────────────────
+echo ""
+echo "[3/4] Configuring Docker permissions..."
+if groups "$USER" | grep -q '\bdocker\b'; then
+  echo "      [✓] User '$USER' already in docker group"
 else
-  echo "[✓] PM2 already installed: $(pm2 -v)"
+  sudo usermod -aG docker "$USER"
+  echo "      [✓] Added '$USER' to docker group"
+  echo "      [!] IMPORTANT: Log out and back in (or run: newgrp docker) for group change to take effect"
 fi
 
-# ── Clone repository ───────────────────────────────────
-if [ ! -d "$APP_DIR" ]; then
-  echo "[*] Cloning repository to $APP_DIR..."
-  sudo mkdir -p $APP_DIR
-  sudo chown $USER:$USER $APP_DIR
-  git clone $REPO_URL $APP_DIR
-else
-  echo "[✓] Repository already exists at $APP_DIR"
-fi
+# ── 4. Enable & start Docker service ─────────────────────────────────────────
+echo ""
+echo "[4/4] Enabling Docker service..."
+sudo systemctl enable docker
+sudo systemctl start docker
+echo "      [✓] Docker service enabled and running"
 
-# ── Install dependencies ───────────────────────────────
-echo "[*] Installing Node dependencies..."
-cd $APP_DIR
-npm install --omit=dev
-
-# ── Setup .env file ────────────────────────────────────
-if [ ! -f "$APP_DIR/.env" ]; then
-  echo "[!] No .env file found!"
-  echo "    Copy .env.example and fill in your values:"
-  echo "    cp $APP_DIR/.env.example $APP_DIR/.env"
-  echo "    nano $APP_DIR/.env"
-else
-  echo "[✓] .env file exists"
-fi
-
-# ── Start app with PM2 ─────────────────────────────────
-echo "[*] Starting app with PM2..."
-cd $APP_DIR
-pm2 start ecosystem.config.json
-pm2 save
-
+# ── Done ──────────────────────────────────────────────────────────────────────
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "  ✓ Server setup complete!"
-echo "  APP_DIR  : $APP_DIR"
-echo "  PM2 list : pm2 list"
-echo "  PM2 logs : pm2 logs app"
+echo ""
+echo "  NEXT STEPS:"
+echo "  1. Log out and back in (for docker group)"
+echo "  2. Verify Docker works:  docker run hello-world"
+echo "  3. Add all GitHub Secrets to your repo"
+echo "  4. Push to main branch — CI/CD will deploy automatically"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

@@ -71,7 +71,7 @@ Thumbs.db
 # =========================
 # Docker
 # =========================
-.dockerignore
+# .dockerignore is tracked (do NOT add it here)
 
 # =========================
 # Database / local storage

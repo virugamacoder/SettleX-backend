@@ -1,3 +1,29 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  SettleX Backend — GitHub Actions CI/CD
+#
+#  Trigger : push to `main` branch
+#  Flow    : Build Docker image → Push to Docker Hub → SSH deploy to AWS EC2
+#
+#  Required GitHub Secrets (Settings → Secrets → Actions):
+#    DOCKER_HUB_USERNAME        Docker Hub username
+#    DOCKER_HUB_TOKEN           Docker Hub access token
+#    SERVER_HOST                EC2 public IP or hostname
+#    SERVER_USER                EC2 SSH user (e.g. ubuntu)
+#    SERVER_SSH_KEY             Full content of EC2 private key (.pem)
+#    SERVER_PORT                SSH port (usually 22)
+#    APP_DIR                    Deploy path on EC2 (e.g. /home/ubuntu/settlex)
+#    NODE_ENV                   production
+#    PORT                       3000
+#    BASE_URL                   https://yourdomain.com or http://EC2_IP
+#    MONGODB_URL                MongoDB Atlas connection string
+#    JWT_SECRET                 JWT secret key
+#    JWT_ACCESS_EXPIRATION_MINUTES   30
+#    JWT_REFRESH_EXPIRATION_DAYS     30
+#    COINMARKET_CAP_API_KEY     CoinMarketCap API key
+#    SSL_CERT_PEM               Content of cert.pem
+#    SSL_PRIVATE_KEY            Content of private.key
+# ─────────────────────────────────────────────────────────────────────────────
+
 name: Deploy SettleX Backend
 
 on:
@@ -5,19 +31,93 @@ on:
     branches:
       - main
 
+env:
+  DOCKER_IMAGE: ${{ secrets.DOCKER_HUB_USERNAME }}/settlex-backend
+
 jobs:
-  deploy:
-    name: Deploy to Production Server (EC2)
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 1: Build & Push Docker Image to Docker Hub
+  # ────────────────────────────────────────────────────────────────────────────
+  build:
+    name: Build & Push Docker Image
     runs-on: ubuntu-latest
 
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tags }}
+
     steps:
-      # ── 1. Checkout code ──────────────────────────────────────────────
-      - name: Checkout Repository
+      - name: Checkout Code
         uses: actions/checkout@v4
 
-      # ── 2. Write SSL certs to server via secrets ──────────────────────
-      #    private.key and cert.pem are stored in GitHub Secrets and
-      #    written directly to the server — never committed to git.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_TOKEN }}
+
+      - name: Extract Docker Metadata (tags & labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.DOCKER_IMAGE }}
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=sha-
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 2: Deploy to AWS EC2 via SSH
+  # ────────────────────────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy to AWS EC2
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # ── Step 1: Write .env file on server ─────────────────────────────────
+      - name: Write .env to Server
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: ${{ secrets.SERVER_PORT }}
+          script: |
+            set -e
+            APP_DIR="${{ secrets.APP_DIR }}"
+            mkdir -p "$APP_DIR"
+
+            echo "──── Writing .env ────"
+            cat > "$APP_DIR/.env" << 'ENVEOF'
+            NODE_ENV=${{ secrets.NODE_ENV }}
+            PORT=${{ secrets.PORT }}
+            BASE_URL=${{ secrets.BASE_URL }}
+            MONGODB_URL=${{ secrets.MONGODB_URL }}
+            JWT_SECRET=${{ secrets.JWT_SECRET }}
+            JWT_ACCESS_EXPIRATION_MINUTES=${{ secrets.JWT_ACCESS_EXPIRATION_MINUTES }}
+            JWT_REFRESH_EXPIRATION_DAYS=${{ secrets.JWT_REFRESH_EXPIRATION_DAYS }}
+            COINMARKET_CAP_API_KEY=${{ secrets.COINMARKET_CAP_API_KEY }}
+            DOCKER_IMAGE=${{ secrets.DOCKER_HUB_USERNAME }}/settlex-backend:latest
+            ENVEOF
+            echo "[✓] .env written"
+
+      # ── Step 2: Write SSL certificates on server ───────────────────────────
       - name: Write SSL Certificates to Server
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -29,14 +129,26 @@ jobs:
             set -e
             CERT_DIR="${{ secrets.APP_DIR }}/nginx/certs"
             mkdir -p "$CERT_DIR"
-            echo "${{ secrets.SSL_PRIVATE_KEY }}" > "$CERT_DIR/private.key"
-            echo "${{ secrets.SSL_CERT_PEM }}"    > "$CERT_DIR/cert.pem"
-            chmod 600 "$CERT_DIR/private.key"
+            printf '%s' '${{ secrets.SSL_CERT_PEM }}'    > "$CERT_DIR/cert.pem"
+            printf '%s' '${{ secrets.SSL_PRIVATE_KEY }}' > "$CERT_DIR/private.key"
             chmod 644 "$CERT_DIR/cert.pem"
+            chmod 600 "$CERT_DIR/private.key"
             echo "[✓] SSL certificates written to $CERT_DIR"
 
-      # ── 3. Deploy app via SSH ─────────────────────────────────────────
-      - name: Deploy Application
+      # ── Step 3: Copy docker-compose + nginx config to server ──────────────
+      - name: Copy Compose & Nginx Config to Server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: ${{ secrets.SERVER_PORT }}
+          source: "docker-compose.yml,nginx/nginx.conf"
+          target: ${{ secrets.APP_DIR }}
+          strip_components: 0
+
+      # ── Step 4: Pull image and restart containers ──────────────────────────
+      - name: Deploy with Docker Compose
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SERVER_HOST }}
@@ -45,43 +157,30 @@ jobs:
           port: ${{ secrets.SERVER_PORT }}
           script: |
             set -e
-
-            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            echo "  SettleX Backend — Starting Deploy  "
-            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
             APP_DIR="${{ secrets.APP_DIR }}"
-            REPO_URL="https://github.com/virugamacoder/SettleX-backend.git"
-
-            # ── First-time: clone repo if not already present ──────────
-            if [ ! -d "$APP_DIR/.git" ]; then
-              echo "[INIT] Repo not found — cloning for the first time..."
-              mkdir -p "$APP_DIR"
-              git clone "$REPO_URL" "$APP_DIR"
-              echo "[INIT] Clone complete."
-            fi
-
             cd "$APP_DIR"
 
-            # Pull latest changes
-            echo "[1/4] Pulling latest code from main..."
-            git fetch origin main
-            git reset --hard origin/main
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "  SettleX Backend — Starting Docker Deployment  "
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-            # Install production dependencies only
-            echo "[2/4] Installing dependencies..."
-            npm install --omit=dev
+            # Log in to Docker Hub on server
+            echo "${{ secrets.DOCKER_HUB_TOKEN }}" | docker login -u "${{ secrets.DOCKER_HUB_USERNAME }}" --password-stdin
 
-            # Reload or start with PM2
-            echo "[3/4] Restarting app with PM2..."
-            pm2 describe app > /dev/null 2>&1 \
-              && pm2 reload ecosystem.config.json --update-env \
-              || pm2 start ecosystem.config.json
+            # Pull latest image
+            echo "[1/3] Pulling latest image..."
+            docker compose pull app
 
-            # Save PM2 process list (survives server reboots)
-            echo "[4/4] Saving PM2 process list..."
-            pm2 save
+            # Restart containers (zero-downtime: new container starts before old stops)
+            echo "[2/3] Restarting containers..."
+            docker compose up -d --remove-orphans
 
-            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            echo "  ✓ Deployment Complete!             "
-            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            # Clean up old/dangling images
+            echo "[3/3] Pruning old images..."
+            docker image prune -f
+
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "  ✓ Deployment Complete!"
+            echo "  Container status:"
+            docker compose ps
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
