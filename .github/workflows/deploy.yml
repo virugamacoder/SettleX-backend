@@ -233,15 +233,17 @@ jobs:
 
             echo "Waiting for app to be healthy..."
             for i in $(seq 1 12); do
-              STATUS=$(docker compose ps --format json 2>/dev/null | grep -o '"Health":"[^"]*"' | head -1 | cut -d'"' -f4 || echo "unknown")
-              HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 http://localhost/health 2>/dev/null || echo "000")
-              echo "  Attempt $i/12 — HTTP: $HTTP_CODE"
-              if [[ "$HTTP_CODE" == "200" ]]; then
-                echo "[✓] Health check passed — app is up on HTTP port 80!"
+              # Check the Node app directly on port 3000 — bypasses nginx entirely,
+              # avoids HTTP→HTTPS redirects and avoids GitHub masking port secrets.
+              RESP=$(curl -s --max-time 5 http://127.0.0.1:3000/health 2>/dev/null || echo "")
+              echo "  Attempt $i/12 — response: $RESP"
+              if echo "$RESP" | grep -q '"status":"ok"'; then
+                echo "[✓] Health check passed — Node app is up!"
+                docker compose ps
                 exit 0
               fi
               sleep 5
             done
-            echo "[!] Health check did not return 200 after 60s"
+            echo "[!] Health check did not return ok after 60s"
             docker compose logs --tail=50 app
             exit 1
