@@ -12,18 +12,21 @@
 #    SERVER_SSH_KEY             Full content of EC2 private key (.pem)
 #    SERVER_PORT                SSH port (usually 22)
 #    APP_DIR                    Deploy path on EC2 (e.g. /home/ubuntu/settlex)
+#    CERTBOT_EMAIL              Email for Let's Encrypt (e.g. you@gmail.com)
 #    NODE_ENV                   production
 #    PORT                       3000
-#    BASE_URL                   http://EC2_IP  (use http:// for IP-only deployments)
+#    BASE_URL                   https://<SERVER_HOST>.nip.io  (e.g. https://16.171.146.88.nip.io)
 #    MONGODB_URL                MongoDB Atlas connection string
 #    JWT_SECRET                 JWT secret key
 #    JWT_ACCESS_EXPIRATION_MINUTES   30
 #    JWT_REFRESH_EXPIRATION_DAYS     30
 #    COINMARKET_CAP_API_KEY     CoinMarketCap API key
 #
-#  NOTE: SSL certs are auto-generated in CI for SERVER_HOST IP — no manual cert secrets needed.
-#  API is served on HTTP port 80 (no browser cert errors).
-#  Port 443 uses an auto-generated self-signed cert (for HTTPS if needed).
+#  HOW SSL WORKS (fully automatic — no manual cert management):
+#    CI/CD uses nip.io (free DNS: 16.171.146.88.nip.io → 16.171.146.88)
+#    to get a real Let's Encrypt trusted certificate via certbot.
+#    This eliminates ERR_CERT_AUTHORITY_INVALID and Mixed Content errors.
+#    Frontend on Vercel (HTTPS) can call this API without any issues.
 # ─────────────────────────────────────────────────────────────────────────────
 
 name: Deploy SettleX Backend
@@ -123,50 +126,60 @@ jobs:
             echo "[✓] .env contents (keys only):"
             cut -d= -f1 "$ENV_FILE"
 
-      # ── Step 2: Auto-generate SSL certificate for SERVER_HOST IP ──────────
-      # Self-signed cert with SAN matching the actual EC2 IP.
-      # This runs entirely on the server — no cert secrets needed in GitHub.
-      - name: Generate SSL Certificate on Server
+      # ── Step 2: Get Let's Encrypt trusted certificate via certbot + nip.io ──
+      # nip.io maps any IP to a real domain for free:
+      #   16.171.146.88.nip.io  →  resolves to  16.171.146.88
+      # certbot gets a real CA-trusted cert — fixes Mixed Content + ERR_CERT errors.
+      - name: Obtain Let's Encrypt Certificate (nip.io)
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
           port: ${{ secrets.SERVER_PORT }}
+          command_timeout: 5m
           script: |
             set -e
-            SERVER_IP="${{ secrets.SERVER_HOST }}"
+            DOMAIN="${{ secrets.SERVER_HOST }}.nip.io"
             CERT_DIR="${{ secrets.APP_DIR }}/nginx/certs"
             mkdir -p "$CERT_DIR"
 
-            # Only regenerate if cert is missing, expired (<7 days), or IP changed
-            REGEN=false
-            if [[ ! -f "$CERT_DIR/cert.pem" ]]; then
-              echo "[cert] No cert found — generating..."
-              REGEN=true
-            elif ! openssl x509 -checkend 604800 -noout -in "$CERT_DIR/cert.pem" 2>/dev/null; then
-              echo "[cert] Cert expires within 7 days — regenerating..."
-              REGEN=true
-            elif ! openssl x509 -noout -text -in "$CERT_DIR/cert.pem" 2>/dev/null | grep -q "$SERVER_IP"; then
-              echo "[cert] Cert does not match current IP ($SERVER_IP) — regenerating..."
-              REGEN=true
-            else
-              echo "[cert] Cert is valid and matches $SERVER_IP — skipping generation"
+            # Install certbot if missing
+            if ! command -v certbot &>/dev/null; then
+              echo "[cert] Installing certbot..."
+              sudo apt-get update -qq
+              sudo apt-get install -y -qq certbot
             fi
 
-            if [[ "$REGEN" == "true" ]]; then
-              openssl req -x509 \
-                -newkey rsa:4096 \
-                -nodes \
-                -keyout "$CERT_DIR/private.key" \
-                -out    "$CERT_DIR/cert.pem" \
-                -days 365 \
-                -subj "/C=IN/ST=Gujarat/L=AWS/O=SettleX/CN=$SERVER_IP" \
-                -addext "subjectAltName=IP:$SERVER_IP,IP:127.0.0.1,DNS:localhost"
-              chmod 600 "$CERT_DIR/private.key"
-              chmod 644 "$CERT_DIR/cert.pem"
-              echo "[✓] SSL certificate generated for IP: $SERVER_IP"
+            # Check if a valid (7+ days) cert already exists for this domain
+            LIVE="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
+            if [[ -f "$LIVE" ]] && openssl x509 -checkend 604800 -noout -in "$LIVE" 2>/dev/null; then
+              echo "[cert] Valid Let's Encrypt cert exists for $DOMAIN — skipping"
+            else
+              echo "[cert] Obtaining Let's Encrypt cert for $DOMAIN..."
+              # Stop nginx so certbot can bind port 80 for the ACME challenge
+              cd "${{ secrets.APP_DIR }}" && docker compose stop nginx 2>/dev/null || true
+              sudo certbot certonly \
+                --standalone \
+                --non-interactive \
+                --agree-tos \
+                --email "${{ secrets.CERTBOT_EMAIL }}" \
+                -d "$DOMAIN"
+              echo "[✓] Certificate obtained for $DOMAIN"
             fi
+
+            # Copy latest certs to nginx/certs/ (nginx container reads from here)
+            sudo cp "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" "$CERT_DIR/cert.pem"
+            sudo cp "/etc/letsencrypt/live/$DOMAIN/privkey.pem"   "$CERT_DIR/private.key"
+            sudo chmod 644 "$CERT_DIR/cert.pem"
+            sudo chmod 600 "$CERT_DIR/private.key"
+            sudo chown "$USER:$USER" "$CERT_DIR/cert.pem" "$CERT_DIR/private.key"
+            echo "[✓] Certs copied to $CERT_DIR"
+
+            # Set up auto-renewal cron (runs twice daily; copies renewed cert + restarts nginx)
+            CRON_CMD="0 */12 * * * sudo certbot renew --quiet && sudo cp /etc/letsencrypt/live/$DOMAIN/fullchain.pem $CERT_DIR/cert.pem && sudo cp /etc/letsencrypt/live/$DOMAIN/privkey.pem $CERT_DIR/private.key && cd ${{ secrets.APP_DIR }} && docker compose restart nginx"
+            (crontab -l 2>/dev/null | grep -v 'certbot renew'; echo "$CRON_CMD") | crontab -
+            echo "[✓] Auto-renewal cron configured"
 
       # ── Step 3: Copy docker-compose + nginx config to server ──────────────
       - name: Copy Compose & Nginx Config to Server
@@ -236,18 +249,18 @@ jobs:
             APP_DIR="${{ secrets.APP_DIR }}"
             cd "$APP_DIR"
 
+            DOMAIN="${{ secrets.SERVER_HOST }}.nip.io"
             echo "Waiting for app to be healthy..."
             for i in $(seq 1 12); do
-              # Check via nginx port 80 (port 3000 is internal Docker only, not mapped to host)
-              # Use grep on response body — avoids GitHub secret masking on HTTP status codes
-              RESP=$(curl -s --max-time 5 http://127.0.0.1/health 2>/dev/null || echo "")
+              # Check via HTTPS on the nip.io domain (matches the Let's Encrypt cert)
+              RESP=$(curl -s --max-time 5 https://$DOMAIN/health 2>/dev/null || echo "")
               if echo "$RESP" | grep -q '"status":"ok"'; then
                 echo "  Attempt $i/12 — PASSED"
-                echo "[✓] Health check passed — app is live!"
+                echo "[✓] Health check passed — https://$DOMAIN is live!"
                 docker compose ps
                 exit 0
               else
-                echo "  Attempt $i/12 — waiting... ($RESP)"
+                echo "  Attempt $i/12 — waiting..."
               fi
               sleep 5
             done
