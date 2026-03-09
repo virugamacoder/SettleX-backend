@@ -7,21 +7,23 @@
 #  Required GitHub Secrets (Settings → Secrets → Actions):
 #    DOCKER_HUB_USERNAME        Docker Hub username
 #    DOCKER_HUB_TOKEN           Docker Hub access token
-#    SERVER_HOST                EC2 public IP or hostname
+#    SERVER_HOST                EC2 public IP (e.g. 16.171.146.88)
 #    SERVER_USER                EC2 SSH user (e.g. ubuntu)
 #    SERVER_SSH_KEY             Full content of EC2 private key (.pem)
 #    SERVER_PORT                SSH port (usually 22)
 #    APP_DIR                    Deploy path on EC2 (e.g. /home/ubuntu/settlex)
 #    NODE_ENV                   production
 #    PORT                       3000
-#    BASE_URL                   https://yourdomain.com or http://EC2_IP
+#    BASE_URL                   http://EC2_IP  (use http:// for IP-only deployments)
 #    MONGODB_URL                MongoDB Atlas connection string
 #    JWT_SECRET                 JWT secret key
 #    JWT_ACCESS_EXPIRATION_MINUTES   30
 #    JWT_REFRESH_EXPIRATION_DAYS     30
 #    COINMARKET_CAP_API_KEY     CoinMarketCap API key
-#    SSL_CERT_PEM               Content of cert.pem
-#    SSL_PRIVATE_KEY            Content of private.key
+#
+#  NOTE: SSL certs are auto-generated in CI for SERVER_HOST IP — no manual cert secrets needed.
+#  API is served on HTTP port 80 (no browser cert errors).
+#  Port 443 uses an auto-generated self-signed cert (for HTTPS if needed).
 # ─────────────────────────────────────────────────────────────────────────────
 
 name: Deploy SettleX Backend
@@ -121,8 +123,10 @@ jobs:
             echo "[✓] .env contents (keys only):"
             cut -d= -f1 "$ENV_FILE"
 
-      # ── Step 2: Write SSL certificates on server ───────────────────────────
-      - name: Write SSL Certificates to Server
+      # ── Step 2: Auto-generate SSL certificate for SERVER_HOST IP ──────────
+      # Self-signed cert with SAN matching the actual EC2 IP.
+      # This runs entirely on the server — no cert secrets needed in GitHub.
+      - name: Generate SSL Certificate on Server
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SERVER_HOST }}
@@ -131,13 +135,38 @@ jobs:
           port: ${{ secrets.SERVER_PORT }}
           script: |
             set -e
+            SERVER_IP="${{ secrets.SERVER_HOST }}"
             CERT_DIR="${{ secrets.APP_DIR }}/nginx/certs"
             mkdir -p "$CERT_DIR"
-            printf '%s' '${{ secrets.SSL_CERT_PEM }}'    > "$CERT_DIR/cert.pem"
-            printf '%s' '${{ secrets.SSL_PRIVATE_KEY }}' > "$CERT_DIR/private.key"
-            chmod 644 "$CERT_DIR/cert.pem"
-            chmod 600 "$CERT_DIR/private.key"
-            echo "[✓] SSL certificates written to $CERT_DIR"
+
+            # Only regenerate if cert is missing, expired (<7 days), or IP changed
+            REGEN=false
+            if [[ ! -f "$CERT_DIR/cert.pem" ]]; then
+              echo "[cert] No cert found — generating..."
+              REGEN=true
+            elif ! openssl x509 -checkend 604800 -noout -in "$CERT_DIR/cert.pem" 2>/dev/null; then
+              echo "[cert] Cert expires within 7 days — regenerating..."
+              REGEN=true
+            elif ! openssl x509 -noout -text -in "$CERT_DIR/cert.pem" 2>/dev/null | grep -q "$SERVER_IP"; then
+              echo "[cert] Cert does not match current IP ($SERVER_IP) — regenerating..."
+              REGEN=true
+            else
+              echo "[cert] Cert is valid and matches $SERVER_IP — skipping generation"
+            fi
+
+            if [[ "$REGEN" == "true" ]]; then
+              openssl req -x509 \
+                -newkey rsa:4096 \
+                -nodes \
+                -keyout "$CERT_DIR/private.key" \
+                -out    "$CERT_DIR/cert.pem" \
+                -days 365 \
+                -subj "/C=IN/ST=Gujarat/L=AWS/O=SettleX/CN=$SERVER_IP" \
+                -addext "subjectAltName=IP:$SERVER_IP,IP:127.0.0.1,DNS:localhost"
+              chmod 600 "$CERT_DIR/private.key"
+              chmod 644 "$CERT_DIR/cert.pem"
+              echo "[✓] SSL certificate generated for IP: $SERVER_IP"
+            fi
 
       # ── Step 3: Copy docker-compose + nginx config to server ──────────────
       - name: Copy Compose & Nginx Config to Server
@@ -188,3 +217,31 @@ jobs:
             echo "  Container status:"
             docker compose ps
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+      # ── Step 5: Verify deployment health ──────────────────────────────────
+      - name: Verify Deployment Health
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: ${{ secrets.SERVER_PORT }}
+          script: |
+            set -e
+            APP_DIR="${{ secrets.APP_DIR }}"
+            cd "$APP_DIR"
+
+            echo "Waiting for app to be healthy..."
+            for i in $(seq 1 12); do
+              STATUS=$(docker compose ps --format json 2>/dev/null | grep -o '"Health":"[^"]*"' | head -1 | cut -d'"' -f4 || echo "unknown")
+              HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 http://localhost/health 2>/dev/null || echo "000")
+              echo "  Attempt $i/12 — HTTP: $HTTP_CODE"
+              if [[ "$HTTP_CODE" == "200" ]]; then
+                echo "[✓] Health check passed — app is up on HTTP port 80!"
+                exit 0
+              fi
+              sleep 5
+            done
+            echo "[!] Health check did not return 200 after 60s"
+            docker compose logs --tail=50 app
+            exit 1
